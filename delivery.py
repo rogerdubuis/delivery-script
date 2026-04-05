@@ -9,12 +9,13 @@ import json
 from datetime import datetime
 import csv
 import math
+import threading
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLineEdit, QLabel, QGridLayout, QDoubleSpinBox, QFrame, QSpinBox, QComboBox,
                              QDialog, QListWidget, QListWidgetItem, QTextEdit, QMessageBox, QInputDialog,
                              QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox)
-from PyQt6.QtCore import QTimer, QRunnable, QThreadPool, pyqtSignal, QObject, Qt
+from PyQt6.QtCore import QTimer, pyqtSignal, QObject, Qt
 from PyQt6.QtGui import QColor, QIcon
 import pyqtgraph as pg
 import numpy as np
@@ -526,20 +527,20 @@ class MFCController:
         '''
 
 
-class SerialWorker(QObject, QRunnable):
+class SerialWorker(QObject):
     data = pyqtSignal(dict)
     connection_status = pyqtSignal(str)
     
     def __init__(self):
-        QObject.__init__(self)
-        QRunnable.__init__(self)
+        super().__init__()
         self.is_running = True
         self.controller = None
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.read_data)
-        self.sampling_rate = 500
+        self.sampling_rate = 0.5
         self.pressure_readings = ["---"] * 6
         self.poll_in_progress = False
+        self._stop_event = threading.Event()
+        self._serial_lock = threading.Lock()
+        self._poll_thread = None
     
     def connect_device(self, port=None):
         try:
@@ -551,14 +552,21 @@ class SerialWorker(QObject, QRunnable):
             selected_port = port or DEFAULT_PORT
             self.controller = MFCController(port=selected_port, timeout=0.2)
             MFCController._instance = self.controller
+            self._stop_event.clear()
             self.connection_status.emit("connected")
-            
-            self.timer.start(self.sampling_rate)
+            if not self._poll_thread or not self._poll_thread.is_alive():
+                self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+                self._poll_thread.start()
             return True
         except Exception as e:
             print(f"Error connecting to device: {e}")
             self.connection_status.emit("disconnected")
             return False
+
+    def _poll_loop(self):
+        while not self._stop_event.is_set():
+            self.read_data()
+            self._stop_event.wait(self.sampling_rate)
     
     def read_data(self):
         if not self.controller or self.poll_in_progress:
@@ -567,7 +575,8 @@ class SerialWorker(QObject, QRunnable):
         self.poll_in_progress = True
         try:
             # Poll only pressure readings here to keep the UI responsive.
-            self.pressure_readings = self.controller.read_all_pressures(verbose=False)
+            with self._serial_lock:
+                self.pressure_readings = self.controller.read_all_pressures(verbose=False)
             flow_data = {'timestamp': time.time()}
             self.data.emit(flow_data)
         except Exception as e:
@@ -589,10 +598,12 @@ class SerialWorker(QObject, QRunnable):
     def stop(self):
         self.is_running = False
         self.poll_in_progress = False
-        if self.timer.isActive():
-            self.timer.stop()
+        self._stop_event.set()
+        if self._poll_thread and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=1.0)
         if self.controller:
-            self.controller.close()
+            with self._serial_lock:
+                self.controller.close()
             self.controller = None
     
     def zero_channel(self, channel):
@@ -601,7 +612,8 @@ class SerialWorker(QObject, QRunnable):
             return False, "Not connected to controller"
             
         try:
-            return self.controller.zero_channel(channel)
+            with self._serial_lock:
+                return self.controller.zero_channel(channel)
         except Exception as e:
             print(f"Error zeroing channel: {e}")
             return False, f"Error: {e}"
@@ -612,7 +624,8 @@ class SerialWorker(QObject, QRunnable):
             return False, "Not connected to controller"
             
         try:
-            return self.controller.set_flow_point(channel, flow_value)
+            with self._serial_lock:
+                return self.controller.set_flow_point(channel, flow_value)
         except Exception as e:
             print(f"Error setting flow point: {e}")
             return False, f"Error: {e}"
@@ -623,7 +636,8 @@ class SerialWorker(QObject, QRunnable):
             return False, "Not connected to controller"
             
         try:
-            return self.controller.get_device_type(channel)
+            with self._serial_lock:
+                return self.controller.get_device_type(channel)
         except Exception as e:
             print(f"Error getting device type: {e}")
             return False, f"Error: {e}"
@@ -634,7 +648,8 @@ class SerialWorker(QObject, QRunnable):
             return False, "Not connected to controller"
             
         try:
-            return self.controller.get_setpoint(channel)
+            with self._serial_lock:
+                return self.controller.get_setpoint(channel)
         except Exception as e:
             print(f"Error getting setpoint: {e}")
             return False, f"Error: {e}"
@@ -645,7 +660,8 @@ class SerialWorker(QObject, QRunnable):
             return False
             
         try:
-            return self.controller.supports_flow_control(channel)
+            with self._serial_lock:
+                return self.controller.supports_flow_control(channel)
         except Exception as e:
             print(f"Error checking flow control support: {e}")
             return False
@@ -1006,6 +1022,9 @@ class MainWindow(QMainWindow):
         for i, (channel_key, color) in enumerate(zip(CHANNEL_KEYS, channel_colors)):
             flow_widget = QWidget()
             flow_layout = QHBoxLayout(flow_widget)
+            flow_layout.setSpacing(6)
+            flow_layout.setContentsMargins(0, 2, 0, 2)
+            flow_widget.setMinimumHeight(36)
             
             color_square = ColorSquare(color)
             flow_layout.addWidget(color_square)
@@ -1013,6 +1032,7 @@ class MainWindow(QMainWindow):
             # Use custom display name from CHANNEL_NAMES dictionary
             channel_label = QLabel(CHANNEL_NAMES[channel_key])
             channel_label.setMinimumWidth(80)
+            channel_label.setMinimumHeight(28)
             flow_layout.addWidget(channel_label)
             
             flow_spinbox = QDoubleSpinBox()
@@ -1020,9 +1040,11 @@ class MainWindow(QMainWindow):
             flow_spinbox.setDecimals(1)
             flow_spinbox.setSuffix(" SCCM")
             flow_spinbox.setSingleStep(0.1)
+            flow_spinbox.setMinimumHeight(28)
             flow_layout.addWidget(flow_spinbox, 1)
             
             set_button = QPushButton("Set")
+            set_button.setMinimumHeight(28)
             set_button.clicked.connect(lambda _, ch=channel_key: self.set_flow_rate(ch))
             flow_layout.addWidget(set_button)
             
@@ -1128,8 +1150,6 @@ class MainWindow(QMainWindow):
         self.serial_worker.data.connect(self.update_plot)
         self.serial_worker.connection_status.connect(self.update_status)
         
-        self.thread_pool = QThreadPool()
-        
         self.is_recording = False
         self.recording_start_time = None
         self.recording_timer = QTimer()
@@ -1154,7 +1174,6 @@ class MainWindow(QMainWindow):
         
         self.serial_worker.connect_device(port=selected_port)
         
-        self.thread_pool.start(self.serial_worker)
     
     def update_status(self, status):
         if status == "connected":
@@ -1392,7 +1411,6 @@ class MainWindow(QMainWindow):
         
         # Connect to the device
         self.serial_worker.connect_device(port=port)
-        self.thread_pool.start(self.serial_worker)
         
     def scan_ports(self):
         """Scan for all available ports using the find_serial_port method which requires admin access"""
