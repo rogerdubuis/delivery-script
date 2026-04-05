@@ -32,6 +32,7 @@ TIME_WINDOW = 30
 MAX_DATA_POINTS = 1000
 WINDOW_SIZE = 20
 ENABLE_SIGNAL_PROCESSING = False
+LEGACY_FIRMWARE_MODE = True
 
 # Custom channel names - modify these to change display names throughout the application
 # The keys must remain as Ch1-Ch6 for internal functionality
@@ -166,6 +167,7 @@ class MFCController:
                 port=port,
                 baudrate=baudrate,
                 timeout=timeout,
+                write_timeout=timeout,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -190,18 +192,29 @@ class MFCController:
     
     def send_command(self, command):
         try:
+            self.ser.reset_input_buffer()
             self.ser.write(command.encode())
-            time.sleep(0.05)
-            
-            if self.ser.in_waiting:
-                response = self.ser.read(self.ser.in_waiting)
+            self.ser.flush()
+
+            deadline = time.monotonic() + max(float(self.ser.timeout or 0), 0.05) + 0.1
+            response = bytearray()
+            while time.monotonic() < deadline:
+                waiting = self.ser.in_waiting
+                if waiting:
+                    response.extend(self.ser.read(waiting))
+                    if b';FF' in response or b'OK' in response or b'NAK' in response:
+                        break
+                else:
+                    time.sleep(0.01)
+
+            if response:
                 try:
                     return response.decode('ascii', errors='ignore').strip()
                 except Exception:
                     return None
             return None
         except Exception as e:
-            print(f"Error sending command: {e}")
+            print(f"Error sending command {command.strip()}: {e}")
             return None
     
     def set_flow_rate(self, channel, flow_rate):
@@ -371,9 +384,10 @@ class MFCController:
         if not self.supports_flow_control(channel):
             return False, "This channel is monitor-only and does not support flow control"
         
-        # Ensure the channel is in setpoint mode
-        if not self.ensure_setpoint_mode(channel):
-            return False, "Failed to set device to setpoint mode"
+        # Older firmware does not support QFE, so skip setpoint-mode queries entirely.
+        if not LEGACY_FIRMWARE_MODE:
+            if not self.ensure_setpoint_mode(channel):
+                return False, "Failed to set device to setpoint mode"
         
         # Format flow value in scientific notation with 2 decimal places
         # Example: 100.0 becomes 1.00E+02
@@ -602,8 +616,13 @@ class SerialWorker(QObject):
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=1.0)
         if self.controller:
-            with self._serial_lock:
-                self.controller.close()
+            if self._serial_lock.acquire(timeout=0.2):
+                try:
+                    self.controller.close()
+                finally:
+                    self._serial_lock.release()
+            else:
+                print("Warning: Timed out waiting for serial lock during disconnect")
             self.controller = None
     
     def zero_channel(self, channel):
@@ -947,6 +966,7 @@ class RecipeDialog(QDialog):
 class MainWindow(QMainWindow):
     flow_command_finished = pyqtSignal(str, bool, str, float)
     disconnect_finished = pyqtSignal()
+    zero_command_finished = pyqtSignal(str, bool, str)
 
     def __init__(self):
         super().__init__()
@@ -1159,6 +1179,7 @@ class MainWindow(QMainWindow):
         self.serial_worker.connection_status.connect(self.update_status)
         self.flow_command_finished.connect(self._handle_flow_command_finished)
         self.disconnect_finished.connect(self._handle_disconnect_finished)
+        self.zero_command_finished.connect(self._handle_zero_command_finished)
         
         self.is_recording = False
         self.recording_start_time = None
@@ -1487,16 +1508,19 @@ class MainWindow(QMainWindow):
         # Disable button and show it's working
         self.zero_button.setEnabled(False)
         self.zero_button.setText("Zeroing...")
-        QApplication.processEvents()
-        
-        # Send the zero command
+        threading.Thread(
+            target=self._zero_channel_worker,
+            args=(channel, channel_display_name),
+            daemon=True
+        ).start()
+
+    def _zero_channel_worker(self, channel, channel_display_name):
         success, message = self.serial_worker.zero_channel(channel)
-        
-        # Re-enable button
+        self.zero_command_finished.emit(channel_display_name, success, message)
+
+    def _handle_zero_command_finished(self, channel_display_name, success, message):
         self.zero_button.setEnabled(True)
         self.zero_button.setText("Zero")
-        
-        # Show result to user
         if success:
             QMessageBox.information(self, "Success", f"Channel {channel_display_name} zeroed successfully")
             print(f"Channel {channel_display_name} zeroed successfully")
