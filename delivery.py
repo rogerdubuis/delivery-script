@@ -555,6 +555,7 @@ class SerialWorker(QObject):
         self._stop_event = threading.Event()
         self._serial_lock = threading.Lock()
         self._poll_thread = None
+        self.polling_enabled = False
     
     def connect_device(self, port=None):
         try:
@@ -568,9 +569,6 @@ class SerialWorker(QObject):
             MFCController._instance = self.controller
             self._stop_event.clear()
             self.connection_status.emit("connected")
-            if not self._poll_thread or not self._poll_thread.is_alive():
-                self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
-                self._poll_thread.start()
             return True
         except Exception as e:
             print(f"Error connecting to device: {e}")
@@ -579,8 +577,20 @@ class SerialWorker(QObject):
 
     def _poll_loop(self):
         while not self._stop_event.is_set():
-            self.read_data()
+            if self.polling_enabled:
+                self.read_data()
             self._stop_event.wait(self.sampling_rate)
+
+    def start_polling(self):
+        if not self.controller:
+            return
+        self.polling_enabled = True
+        if not self._poll_thread or not self._poll_thread.is_alive():
+            self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+            self._poll_thread.start()
+
+    def stop_polling(self):
+        self.polling_enabled = False
     
     def read_data(self):
         if not self.controller or self.poll_in_progress:
@@ -611,6 +621,7 @@ class SerialWorker(QObject):
     
     def stop(self):
         self.is_running = False
+        self.polling_enabled = False
         self.poll_in_progress = False
         self._stop_event.set()
         if self._poll_thread and self._poll_thread.is_alive():
@@ -631,8 +642,17 @@ class SerialWorker(QObject):
             return False, "Not connected to controller"
             
         try:
-            with self._serial_lock:
+            self.stop_polling()
+            if self.poll_in_progress:
+                deadline = time.monotonic() + 0.5
+                while self.poll_in_progress and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            if not self._serial_lock.acquire(timeout=0.5):
+                return False, "Timed out waiting for serial device"
+            try:
                 return self.controller.zero_channel(channel)
+            finally:
+                self._serial_lock.release()
         except Exception as e:
             print(f"Error zeroing channel: {e}")
             return False, f"Error: {e}"
@@ -643,8 +663,17 @@ class SerialWorker(QObject):
             return False, "Not connected to controller"
             
         try:
-            with self._serial_lock:
+            self.stop_polling()
+            if self.poll_in_progress:
+                deadline = time.monotonic() + 0.5
+                while self.poll_in_progress and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            if not self._serial_lock.acquire(timeout=0.5):
+                return False, "Timed out waiting for serial device"
+            try:
                 return self.controller.set_flow_point(channel, flow_value)
+            finally:
+                self._serial_lock.release()
         except Exception as e:
             print(f"Error setting flow point: {e}")
             return False, f"Error: {e}"
