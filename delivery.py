@@ -33,6 +33,7 @@ MAX_DATA_POINTS = 1000
 WINDOW_SIZE = 20
 ENABLE_SIGNAL_PROCESSING = False
 LEGACY_FIRMWARE_MODE = True
+DEBUG_SERIAL = os.environ.get("DELIVERY_DEBUG_SERIAL", "1") != "0"
 
 # Custom channel names - modify these to change display names throughout the application
 # The keys must remain as Ch1-Ch6 for internal functionality
@@ -176,6 +177,12 @@ class MFCController:
                 dsrdtr=False
             )
             print(f"Connected to controller on {port}")
+            if DEBUG_SERIAL:
+                print(
+                    "Serial settings: "
+                    f"baud={baudrate}, timeout={timeout}, write_timeout={timeout}, "
+                    f"bytesize=8, parity=N, stopbits=1"
+                )
             self.port = port
             
             # Update to use channel names from CHANNEL_NAMES dictionary
@@ -190,10 +197,34 @@ class MFCController:
             print(f"Error during initialization: {e}")
             raise
     
+    def _log_serial_payload(self, direction, command, payload, elapsed_ms=None, note=""):
+        if not DEBUG_SERIAL:
+            return
+
+        if isinstance(payload, str):
+            payload_bytes = payload.encode('ascii', errors='replace')
+        else:
+            payload_bytes = bytes(payload)
+
+        hex_payload = payload_bytes.hex(' ') if payload_bytes else "<empty>"
+        ascii_payload = payload_bytes.decode('ascii', errors='replace') if payload_bytes else ""
+        suffix = []
+        if elapsed_ms is not None:
+            suffix.append(f"{elapsed_ms:.1f} ms")
+        if note:
+            suffix.append(note)
+        suffix_text = f" [{' | '.join(suffix)}]" if suffix else ""
+        print(f"{direction} {command.strip()}{suffix_text}")
+        print(f"  ascii: {ascii_payload!r}")
+        print(f"  hex:   {hex_payload}")
+
     def send_command(self, command):
         try:
+            started = time.monotonic()
             self.ser.reset_input_buffer()
-            self.ser.write(command.encode())
+            encoded_command = command.encode()
+            self._log_serial_payload("TX", command, encoded_command)
+            self.ser.write(encoded_command)
             self.ser.flush()
 
             deadline = time.monotonic() + max(float(self.ser.timeout or 0), 0.05) + 0.1
@@ -208,10 +239,14 @@ class MFCController:
                     time.sleep(0.01)
 
             if response:
+                elapsed_ms = (time.monotonic() - started) * 1000
+                self._log_serial_payload("RX", command, response, elapsed_ms=elapsed_ms)
                 try:
                     return response.decode('ascii', errors='ignore').strip()
                 except Exception:
                     return None
+            elapsed_ms = (time.monotonic() - started) * 1000
+            self._log_serial_payload("RX", command, b"", elapsed_ms=elapsed_ms, note="timeout/no response")
             return None
         except Exception as e:
             print(f"Error sending command {command.strip()}: {e}")
