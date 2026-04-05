@@ -296,10 +296,10 @@ class MFCController:
             print(f"Closed connection to {self.port}")
     
     def read_pressure(self, channel):
-        """Read pressure from specified channel using the configured controller address."""
+        """Read flow from specified MFC channel using the 946 FR command."""
         if not 1 <= channel <= 6:
             return None
-        cmd = f"@{CONTROLLER_ADDRESS}PR{channel}?;FF\r"
+        cmd = f"@{CONTROLLER_ADDRESS}FR{channel}?;FF\r"
         return self.send_command(cmd)
     
     def parse_pressure_response(self, response):
@@ -420,10 +420,8 @@ class MFCController:
         if not self.supports_flow_control(channel):
             return False, "This channel is monitor-only and does not support flow control"
         
-        # Older firmware does not support QFE, so skip setpoint-mode queries entirely.
-        if not LEGACY_FIRMWARE_MODE:
-            if not self.ensure_setpoint_mode(channel):
-                return False, "Failed to set device to setpoint mode"
+        if not self.ensure_setpoint_mode(channel):
+            return False, "Failed to set device to setpoint mode"
         
         # Format flow value in scientific notation with 2 decimal places
         # Example: 100.0 becomes 1.00E+02
@@ -458,21 +456,21 @@ class MFCController:
         if not 1 <= channel <= 6:
             return False
             
-        # Check current mode
-        cmd = f"@{CONTROLLER_ADDRESS}QFE{channel}?;FF\r"  # Query Flow Control Enable
+        # The 946 uses QMD to query and set the MFC operating mode.
+        cmd = f"@{CONTROLLER_ADDRESS}QMD{channel}?;FF\r"
         response = self.send_command(cmd)
         
         if not response:
             return False
-            
-        # If mode is not already set to setpoint (1), set it
-        if "ACK0" in response:  # 0 means not in setpoint mode
-            # Set to setpoint mode
-            cmd = f"@{CONTROLLER_ADDRESS}QFE{channel}!1;FF\r"
-            response = self.send_command(cmd)
-            return "ACK" in response if response else False
-            
-        return True  # Already in setpoint mode
+
+        match = re.search(r'@\d+ACK(.*?);FF', response)
+        mode = match.group(1).strip().upper() if match else ""
+        if mode == "SETPOINT":
+            return True
+
+        cmd = f"@{CONTROLLER_ADDRESS}QMD{channel}!SETPOINT;FF\r"
+        response = self.send_command(cmd)
+        return "ACK" in response if response else False
 
     def get_device_type(self, channel):
         """Get the type of device connected to the specified channel
@@ -552,8 +550,8 @@ class MFCController:
             return False
             
         # Special case for all channels with older firmware
-        # that doesn't support QFE but still supports QSP
-        print(f"Bypassing QFE check for channel {channel} (Slot {['A','A','B','B','C','C'][channel-1]}) with older firmware")
+        # Flow control probing is still bypassed for now, but the 946-native mode command is QMD.
+        print(f"Bypassing QMD check for channel {channel} (Slot {['A','A','B','B','C','C'][channel-1]}) with older firmware")
         return True
         
         # The following code is disabled to treat all channels as legacy
@@ -1680,21 +1678,21 @@ class MainWindow(QMainWindow):
         else:
             report += f"Failed to get setpoint: {setpoint}\n"
         
-        # 3. Check if setpoint mode is supported
-        cmd = f"@{CONTROLLER_ADDRESS}QFE{channel}?;FF\r"
+        # 3. Check the current MFC mode
+        cmd = f"@{CONTROLLER_ADDRESS}QMD{channel}?;FF\r"
         response = self.serial_worker.controller.send_command(cmd)
         if response:
-            report += f"Flow Control Query Response: {response}\n"
-            if "ACK1" in response:
-                report += "Status: In setpoint mode\n"
-            elif "ACK0" in response:
-                report += "Status: Not in setpoint mode (can be changed)\n"
-            elif "NAK" in response:
-                report += "Status: Flow control not supported for this channel\n"
-                report += "This indicates the 946 does not detect an MFC on this channel.\n"
+            report += f"MFC Mode Query Response: {response}\n"
+            if "NAK" in response:
+                report += "Status: MFC mode query not supported for this channel\n"
+                report += "This indicates the 946 may not detect an MFC on this channel.\n"
                 report += "Check the physical installation and slot mapping.\n"
+            else:
+                mode_match = re.search(r'@\d+ACK(.*?);FF', response)
+                if mode_match:
+                    report += f"Status: Current mode = {mode_match.group(1).strip()}\n"
         else:
-            report += "No response to flow control query\n"
+            report += "No response to MFC mode query\n"
         
         # 4. Read current value
         response = self.serial_worker.controller.read_pressure(channel)
