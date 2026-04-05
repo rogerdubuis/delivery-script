@@ -358,6 +358,77 @@ class MFCController:
                 return False, f"Unexpected response: {response}"
         else:
             return False, "No response received"
+
+    def extract_ack_payload(self, response):
+        """Extract payload from @<addr>ACK...;FF responses."""
+        if not response:
+            return None
+        match = re.search(r'@\d+ACK(.*?);FF', response)
+        if not match:
+            return None
+        return match.group(1).strip()
+
+    def probe_mfc_channel(self, channel):
+        """Probe a channel using native 946 MFC commands."""
+        slot_mapping = {
+            1: "A1", 2: "A2",
+            3: "B1", 4: "B2",
+            5: "C1", 6: "C2"
+        }
+        probe_commands = {
+            'flow': f"@{CONTROLLER_ADDRESS}FR{channel}?;FF\r",
+            'setpoint': f"@{CONTROLLER_ADDRESS}QSP{channel}?;FF\r",
+            'mode': f"@{CONTROLLER_ADDRESS}QMD{channel}?;FF\r",
+        }
+
+        probe_results = {}
+        for name, cmd in probe_commands.items():
+            response = self.send_command(cmd)
+            probe_results[name] = {
+                'command': cmd.strip(),
+                'response': response,
+                'ack_payload': self.extract_ack_payload(response),
+                'responded': bool(response),
+                'nak': bool(response and "NAK" in response),
+            }
+
+        responded_commands = [
+            name for name, result in probe_results.items()
+            if result['responded'] and not result['nak']
+        ]
+
+        return {
+            'slot': slot_mapping.get(channel, "Unknown"),
+            'channel': channel,
+            'responses': probe_results,
+            'is_mfc': bool(responded_commands),
+            'device_type': "MFC probe response" if responded_commands else "No MFC response",
+            'working_commands': responded_commands,
+        }
+
+    def probe_mfc_channels(self):
+        """Probe all channels using documented 946 MFC commands."""
+        mfc_channels = {}
+
+        print("\nMFC Channel Probe:")
+        print("------------------")
+        print("Slot A = channels 1 and 2 (A1 and A2)")
+        print("Slot B = channels 3 and 4 (B1 and B2)")
+        print("Slot C = channels 5 and 6 (C1 and C2)")
+        print("------------------")
+
+        for channel in range(1, 7):
+            info = self.probe_mfc_channel(channel)
+            mfc_channels[channel] = info
+            if info['is_mfc']:
+                print(
+                    f"Channel {channel} (Slot {info['slot']}): RESPONSE on "
+                    f"{', '.join(info['working_commands'])}"
+                )
+            else:
+                print(f"Channel {channel} (Slot {info['slot']}): NO RESPONSE")
+
+        return mfc_channels
     
     def identify_mfc_channels(self):
         """Identify which channels have MFC hardware installed
@@ -365,43 +436,7 @@ class MFCController:
         Returns:
             dict: Dictionary with channel numbers as keys and MFC status as values
         """
-        mfc_channels = {}
-        slot_mapping = {
-            1: "A1", 2: "A2",
-            3: "B1", 4: "B2",
-            5: "C1", 6: "C2"
-        }
-        
-        print("\nMFC Channel Identification:")
-        print("---------------------------")
-        print("Slot A = channels 1 and 2 (A1 and A2)")
-        print("Slot B = channels 3 and 4 (B1 and B2)")
-        print("Slot C = channels 5 and 6 (C1 and C2)")
-        print("---------------------------")
-        
-        for channel in range(1, 7):
-            success, device_type = self.get_device_type(channel)
-            supports_flow = self.supports_flow_control(channel)
-            
-            slot_name = slot_mapping.get(channel, "Unknown")
-            
-            if success and supports_flow:
-                mfc_channels[channel] = {
-                    "slot": slot_name,
-                    "device_type": device_type,
-                    "is_mfc": True
-                }
-                print(f"Channel {channel} (Slot {slot_name}): MFC DETECTED - Type: {device_type}")
-            else:
-                mfc_type = "Unknown" if not success else device_type
-                mfc_channels[channel] = {
-                    "slot": slot_name,
-                    "device_type": mfc_type,
-                    "is_mfc": False
-                }
-                print(f"Channel {channel} (Slot {slot_name}): NO MFC - Type: {mfc_type}")
-        
-        return mfc_channels
+        return self.probe_mfc_channels()
     
     def set_flow_point(self, channel, flow_value):
         """Set flow point for specified channel using QSPn command
@@ -461,16 +496,23 @@ class MFCController:
         response = self.send_command(cmd)
         
         if not response:
+            if LEGACY_FIRMWARE_MODE:
+                print(f"No QMD response for channel {channel}; trying direct QSP due to legacy mode")
+                return True
             return False
 
-        match = re.search(r'@\d+ACK(.*?);FF', response)
-        mode = match.group(1).strip().upper() if match else ""
+        mode = (self.extract_ack_payload(response) or "").upper()
         if mode == "SETPOINT":
             return True
 
         cmd = f"@{CONTROLLER_ADDRESS}QMD{channel}!SETPOINT;FF\r"
         response = self.send_command(cmd)
-        return "ACK" in response if response else False
+        if response:
+            return "ACK" in response
+        if LEGACY_FIRMWARE_MODE:
+            print(f"No QMD set-mode response for channel {channel}; trying direct QSP due to legacy mode")
+            return True
+        return False
 
     def get_device_type(self, channel):
         """Get the type of device connected to the specified channel
@@ -550,9 +592,8 @@ class MFCController:
             return False
             
         # Special case for all channels with older firmware
-        # Flow control probing is still bypassed for now, but the 946-native mode command is QMD.
-        print(f"Bypassing QMD check for channel {channel} (Slot {['A','A','B','B','C','C'][channel-1]}) with older firmware")
-        return True
+        probe = self.probe_mfc_channel(channel)
+        return probe['is_mfc']
         
         # The following code is disabled to treat all channels as legacy
         '''
@@ -1773,36 +1814,45 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Not Connected", "Please connect to the device first")
             return
             
-        # Identify MFC channels
-        mfc_channels = self.serial_worker.controller.identify_mfc_channels()
+        # Probe channels using documented 946 MFC commands
+        mfc_channels = self.serial_worker.controller.probe_mfc_channels()
         
         # Create report
-        report = "MFC CHANNEL IDENTIFICATION\n"
-        report += "=========================\n\n"
+        report = "MFC CHANNEL PROBE\n"
+        report += "=================\n\n"
         report += "Slot A = channels 1 and 2 (A1 and A2)\n"
         report += "Slot B = channels 3 and 4 (B1 and B2)\n"
         report += "Slot C = channels 5 and 6 (C1 and C2)\n\n"
-        report += "DETECTED MFC HARDWARE:\n"
-        report += "-----------------------\n"
+        report += "A channel is considered responsive if the 946 replies to one or more native\n"
+        report += "MFC commands: FR (flow read), QSP (setpoint query), or QMD (mode query).\n\n"
+        report += "RESPONSIVE CHANNELS:\n"
+        report += "--------------------\n"
         
         found_mfc = False
         for channel, info in mfc_channels.items():
             if info["is_mfc"]:
                 found_mfc = True
-                report += f"Channel {channel} (Slot {info['slot']}): MFC DETECTED - Type: {info['device_type']}\n"
+                report += (
+                    f"Channel {channel} (Slot {info['slot']}): RESPONDED on "
+                    f"{', '.join(info['working_commands'])}\n"
+                )
         
         if not found_mfc:
-            report += "NO MFC HARDWARE DETECTED ON ANY CHANNEL!\n\n"
+            report += "NO CHANNEL RESPONDED TO NATIVE 946 MFC COMMANDS.\n\n"
             report += "Possible causes:\n"
             report += "1. MFC is not properly connected to the 946 controller\n"
-            report += "2. MFC module is not installed in the 946 controller\n"
-            report += "3. Communication issues with the 946 controller\n"
+            report += "2. MFC module is not installed or configured in the 946 controller\n"
+            report += "3. The selected serial port/settings are wrong\n"
+            report += "4. The controller is in a different communication mode\n"
         
-        report += "\n\nNON-MFC CHANNELS:\n"
-        report += "-----------------\n"
+        report += "\n\nPER-CHANNEL DETAILS:\n"
+        report += "--------------------\n"
         for channel, info in mfc_channels.items():
-            if not info["is_mfc"]:
-                report += f"Channel {channel} (Slot {info['slot']}): Type: {info['device_type']}\n"
+            report += f"Channel {channel} (Slot {info['slot']}):\n"
+            for command_name in ['flow', 'setpoint', 'mode']:
+                result = info['responses'][command_name]
+                response_text = result['response'] if result['response'] else "NO RESPONSE"
+                report += f"  {command_name.upper()} -> {response_text}\n"
         
         report += "\n\nIMPORTANT: When setting flow rates, you MUST use the channel\n"
         report += "number that corresponds to the slot where your MFC is installed.\n"
@@ -1971,9 +2021,9 @@ class MainWindow(QMainWindow):
             return
             
         # First identify all MFC channels
-        print("Checking for MFC hardware...")
+        print("Checking channel responses with native 946 MFC commands...")
         if self.serial_worker.controller:
-            mfc_channels = self.serial_worker.controller.identify_mfc_channels()
+            mfc_channels = self.serial_worker.controller.probe_mfc_channels()
             
             # Display a notification about detected MFCs
             detected_mfcs = []
@@ -1982,19 +2032,17 @@ class MainWindow(QMainWindow):
                     detected_mfcs.append(f"Channel {channel} (Slot {info['slot']})")
             
             if detected_mfcs and show_dialog:
-                message = "MFC hardware detected on:\n" + "\n".join(detected_mfcs)
-                message += "\n\nNOTE: All channels have older firmware (FC 1.23) that doesn't support QIT/QFE."
-                message += "\nFlow control has been enabled for all channels despite the firmware limitations."
-                message += "\n\nPlease use these channel numbers when setting flow rates."
-                QMessageBox.information(self, "MFC Hardware Detected", message)
+                message = "Native 946 MFC commands responded on:\n" + "\n".join(detected_mfcs)
+                message += "\n\nUse the 'Identify MFC Channels' button for per-command details."
+                QMessageBox.information(self, "Responsive MFC Channels", message)
             elif not detected_mfcs and show_dialog:
-                message = ("No MFC hardware detected on any channel.\n\n"
+                message = ("No channel responded to native 946 MFC commands.\n\n"
                            "If you have MFCs connected, please check:\n"
                            "1. The MFC is physically installed in the correct slot\n"
                            "2. The MFC is properly connected to the 946 controller\n"
-                           "3. The 946 controller is properly configured\n\n"
+                           "3. The 946 controller is properly configured for flow control\n\n"
                            "Use the 'Identify MFC Channels' button for more details.")
-                QMessageBox.warning(self, "No MFC Hardware Detected", message)
+                QMessageBox.warning(self, "No Responsive MFC Channels", message)
             
         for channel in self.flow_controls:
             channel_num = int(channel[2:])
