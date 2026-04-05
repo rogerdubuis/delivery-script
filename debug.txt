@@ -1,3 +1,7 @@
 python3 -c "import serial; print(serial.__file__); print(hasattr(serial, 'SerialException')); print(getattr(serial, '__version__', 'no_version'))"
 python3 -m pip show pyserial
 python3 -m pip show serial
+
+python3 -c "import sys, serial; print(serial); print(serial.__spec__); print(getattr(serial, '__path__', None)); print(sys.executable)"
+python3 -m pip list | grep -i serial
+python3 -c "import serial; print(serial.__file__); print(hasattr(serial, 'SerialException'))"
