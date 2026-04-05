@@ -945,6 +945,9 @@ class RecipeDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    flow_command_finished = pyqtSignal(str, bool, str, float)
+    disconnect_finished = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Precision Olfactometer")
@@ -1121,8 +1124,12 @@ class MainWindow(QMainWindow):
         
         recording_widget = QWidget()
         recording_layout = QHBoxLayout(recording_widget)
+        recording_layout.setSpacing(6)
+        recording_layout.setContentsMargins(0, 2, 0, 2)
+        recording_widget.setMinimumHeight(36)
         
         self.record_button = QPushButton("Start Recording")
+        self.record_button.setMinimumHeight(28)
         self.record_button.clicked.connect(self.toggle_recording)
         recording_layout.addWidget(self.record_button)
         
@@ -1130,6 +1137,7 @@ class MainWindow(QMainWindow):
         self.recording_duration.setRange(10, 3600)
         self.recording_duration.setValue(60)
         self.recording_duration.setSuffix(" s")
+        self.recording_duration.setMinimumHeight(28)
         recording_layout.addWidget(self.recording_duration)
         
         right_column_layout.addWidget(recording_widget)
@@ -1149,6 +1157,8 @@ class MainWindow(QMainWindow):
         self.serial_worker = SerialWorker()
         self.serial_worker.data.connect(self.update_plot)
         self.serial_worker.connection_status.connect(self.update_status)
+        self.flow_command_finished.connect(self._handle_flow_command_finished)
+        self.disconnect_finished.connect(self._handle_disconnect_finished)
         
         self.is_recording = False
         self.recording_start_time = None
@@ -1217,8 +1227,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Permission Error", "Please restart the application after logging back in.")
     
     def disconnect_device(self):
-        self.serial_worker.stop()
-        self.update_status("disconnected")
+        self.connect_button.setEnabled(False)
+        self.connect_button.setText("Disconnecting...")
+        threading.Thread(target=self._disconnect_worker, daemon=True).start()
     
     def update_plot(self, data):
         if self.start_time is None:
@@ -1263,21 +1274,41 @@ class MainWindow(QMainWindow):
             return
             
         flow_rate = self.flow_controls[channel]['spinbox'].value()
-        self.flow_controls[channel]['button'].setStyleSheet("background-color: orange;")
+        button = self.flow_controls[channel]['button']
+        button.setEnabled(False)
+        button.setStyleSheet("background-color: orange;")
         
-        # Use the set_flow_point method instead of direct command
         channel_num = int(channel[2:])  # Extract number from "Ch1", "Ch2", etc.
+        threading.Thread(
+            target=self._set_flow_rate_worker,
+            args=(channel, channel_num, flow_rate),
+            daemon=True
+        ).start()
+
+    def _set_flow_rate_worker(self, channel, channel_num, flow_rate):
         success, message = self.serial_worker.set_flow_point(channel_num, flow_rate)
-        
+        self.flow_command_finished.emit(channel, success, message, flow_rate)
+
+    def _handle_flow_command_finished(self, channel, success, message, flow_rate):
+        button = self.flow_controls[channel]['button']
+        button.setEnabled(True)
         if success:
-            self.flow_controls[channel]['button'].setStyleSheet("background-color: green;")
-            QTimer.singleShot(500, lambda: self.flow_controls[channel]['button'].setStyleSheet(""))
+            button.setStyleSheet("background-color: green;")
+            QTimer.singleShot(500, lambda: button.setStyleSheet(""))
             print(f"Set {channel} to {flow_rate} SCCM")
         else:
-            self.flow_controls[channel]['button'].setStyleSheet("background-color: red;")
-            QTimer.singleShot(500, lambda: self.flow_controls[channel]['button'].setStyleSheet(""))
+            button.setStyleSheet("background-color: red;")
+            QTimer.singleShot(500, lambda: button.setStyleSheet(""))
             print(f"Failed to set {channel}: {message}")
             QMessageBox.warning(self, "Setting Failed", f"Failed to set flow rate for {channel}: {message}")
+
+    def _disconnect_worker(self):
+        self.serial_worker.stop()
+        self.disconnect_finished.emit()
+
+    def _handle_disconnect_finished(self):
+        self.connect_button.setEnabled(True)
+        self.update_status("disconnected")
     
     def create_mixture(self):
         """Open the RecipeDialog to create a new mixture recipe."""
