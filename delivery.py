@@ -274,7 +274,7 @@ class MFCController:
         except Exception:
             return None
     
-    def read_all_pressures(self):
+    def read_all_pressures(self, verbose=True):
         """Read all pressure channels with minimal delay"""
         readings = []
         for i in range(1, 7):
@@ -285,8 +285,9 @@ class MFCController:
             else:
                 readings.append("---")
         
-        # Display in terminal with custom channel names
-        print(f"{CHANNEL_NAMES['Ch1']}: {readings[0]} | {CHANNEL_NAMES['Ch2']}: {readings[1]} | {CHANNEL_NAMES['Ch3']}: {readings[2]} | {CHANNEL_NAMES['Ch4']}: {readings[3]} | {CHANNEL_NAMES['Ch5']}: {readings[4]} | {CHANNEL_NAMES['Ch6']}: {readings[5]}")
+        # Display in terminal with custom channel names when explicitly requested.
+        if verbose:
+            print(f"{CHANNEL_NAMES['Ch1']}: {readings[0]} | {CHANNEL_NAMES['Ch2']}: {readings[1]} | {CHANNEL_NAMES['Ch3']}: {readings[2]} | {CHANNEL_NAMES['Ch4']}: {readings[3]} | {CHANNEL_NAMES['Ch5']}: {readings[4]} | {CHANNEL_NAMES['Ch6']}: {readings[5]}")
         
         return readings
     
@@ -536,17 +537,19 @@ class SerialWorker(QObject, QRunnable):
         self.controller = None
         self.timer = QTimer()
         self.timer.timeout.connect(self.read_data)
-        self.sampling_rate = 100
+        self.sampling_rate = 500
         self.pressure_readings = ["---"] * 6
+        self.poll_in_progress = False
     
-    def connect_device(self):
+    def connect_device(self, port=None):
         try:
             self.connection_status.emit("connecting")
             if not setup_permissions():
                 self.connection_status.emit("permission_error")
                 return False
 
-            self.controller = MFCController(port=DEFAULT_PORT)
+            selected_port = port or DEFAULT_PORT
+            self.controller = MFCController(port=selected_port, timeout=0.2)
             MFCController._instance = self.controller
             self.connection_status.emit("connected")
             
@@ -558,20 +561,19 @@ class SerialWorker(QObject, QRunnable):
             return False
     
     def read_data(self):
-        if not self.controller:
+        if not self.controller or self.poll_in_progress:
             return
             
+        self.poll_in_progress = True
         try:
-            # Read flow rates
-            flow_data = self.controller.read_all_channels()
-            
-            # Read pressure values
-            self.pressure_readings = self.controller.read_all_pressures()
-            
-            # Send flow data to UI
+            # Poll only pressure readings here to keep the UI responsive.
+            self.pressure_readings = self.controller.read_all_pressures(verbose=False)
+            flow_data = {'timestamp': time.time()}
             self.data.emit(flow_data)
         except Exception as e:
             print(f"Error reading data: {e}")
+        finally:
+            self.poll_in_progress = False
     
     def send_command(self, channel, flow_rate):
         if not self.controller:
@@ -586,10 +588,12 @@ class SerialWorker(QObject, QRunnable):
     
     def stop(self):
         self.is_running = False
+        self.poll_in_progress = False
         if self.timer.isActive():
             self.timer.stop()
         if self.controller:
             self.controller.close()
+            self.controller = None
     
     def zero_channel(self, channel):
         """Zero the specified channel"""
@@ -1148,7 +1152,7 @@ class MainWindow(QMainWindow):
         MFCController._instance = None
         MFCController.find_serial_port = lambda: selected_port
         
-        self.serial_worker.connect_device()
+        self.serial_worker.connect_device(port=selected_port)
         
         self.thread_pool.start(self.serial_worker)
     
@@ -1166,8 +1170,8 @@ class MainWindow(QMainWindow):
             # Enable identify button when connected
             self.identify_mfc_button.setEnabled(True)
             
-            # Check which channels support flow control
-            self.check_flow_control_support()
+            # Check which channels support flow control without blocking startup with a popup.
+            QTimer.singleShot(0, lambda: self.check_flow_control_support(show_dialog=False))
                 
         elif status == "disconnected":
             self.status_label.setText("Status: Disconnected")
@@ -1387,7 +1391,7 @@ class MainWindow(QMainWindow):
         MFCController._instance = None
         
         # Connect to the device
-        self.serial_worker.connect_device()
+        self.serial_worker.connect_device(port=port)
         self.thread_pool.start(self.serial_worker)
         
     def scan_ports(self):
@@ -1821,7 +1825,7 @@ class MainWindow(QMainWindow):
         
         dialog.exec()
 
-    def check_flow_control_support(self):
+    def check_flow_control_support(self, show_dialog=True):
         """Check which channels support flow control and update UI accordingly"""
         if not self.serial_worker:
             return
@@ -1837,13 +1841,13 @@ class MainWindow(QMainWindow):
                 if info.get("is_mfc", False):
                     detected_mfcs.append(f"Channel {channel} (Slot {info['slot']})")
             
-            if detected_mfcs:
+            if detected_mfcs and show_dialog:
                 message = "MFC hardware detected on:\n" + "\n".join(detected_mfcs)
                 message += "\n\nNOTE: All channels have older firmware (FC 1.23) that doesn't support QIT/QFE."
                 message += "\nFlow control has been enabled for all channels despite the firmware limitations."
                 message += "\n\nPlease use these channel numbers when setting flow rates."
                 QMessageBox.information(self, "MFC Hardware Detected", message)
-            else:
+            elif not detected_mfcs and show_dialog:
                 message = ("No MFC hardware detected on any channel.\n\n"
                            "If you have MFCs connected, please check:\n"
                            "1. The MFC is physically installed in the correct slot\n"
