@@ -1188,8 +1188,7 @@ class MainWindow(QMainWindow):
         
         self.start_time = None
         
-        # Auto-connect to the proper port on startup
-        QTimer.singleShot(500, self.auto_connect)
+        # Leave connection manual so startup stays responsive even if the controller stalls.
     
     def refresh_ports(self):
         self.port_combo.clear()
@@ -1219,9 +1218,14 @@ class MainWindow(QMainWindow):
             
             # Enable identify button when connected
             self.identify_mfc_button.setEnabled(True)
-            
-            # Check which channels support flow control without blocking startup with a popup.
-            QTimer.singleShot(0, lambda: self.check_flow_control_support(show_dialog=False))
+
+            # In legacy firmware mode, treat all channels as controllable without probing them on connect.
+            for channel in self.flow_controls:
+                self.flow_controls[channel]['button'].setEnabled(True)
+                self.flow_controls[channel]['spinbox'].setEnabled(True)
+                self.flow_controls[channel]['button'].setText("Set")
+                if 'monitor_label' in self.flow_controls[channel]:
+                    self.flow_controls[channel]['monitor_label'].hide()
                 
         elif status == "disconnected":
             self.status_label.setText("Status: Disconnected")
