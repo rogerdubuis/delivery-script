@@ -34,6 +34,7 @@ WINDOW_SIZE = 20
 ENABLE_SIGNAL_PROCESSING = False
 LEGACY_FIRMWARE_MODE = True
 DEBUG_SERIAL = os.environ.get("DELIVERY_DEBUG_SERIAL", "1") != "0"
+CONTROLLER_ADDRESS = os.environ.get("DELIVERY_CONTROLLER_ADDRESS", "253")
 
 # Custom channel names - modify these to change display names throughout the application
 # The keys must remain as Ch1-Ch6 for internal functionality
@@ -295,19 +296,19 @@ class MFCController:
             print(f"Closed connection to {self.port}")
     
     def read_pressure(self, channel):
-        """Read pressure from specified channel using @254PRx?;FF format with minimal delay"""
+        """Read pressure from specified channel using the configured controller address."""
         if not 1 <= channel <= 6:
             return None
-        cmd = f"@254PR{channel}?;FF\r"
+        cmd = f"@{CONTROLLER_ADDRESS}PR{channel}?;FF\r"
         return self.send_command(cmd)
     
     def parse_pressure_response(self, response):
-        """Parse response between @253ACK and ;FF"""
+        """Parse ACK response payload between @<addr>ACK and ;FF."""
         if not response:
             return None
         
         try:
-            match = re.search(r'@253ACK(.*?);FF', response)
+            match = re.search(r'@\d+ACK(.*?);FF', response)
             if not match:
                 return None
             
@@ -345,7 +346,7 @@ class MFCController:
         if not 1 <= channel <= 6:
             return False, "Invalid channel number"
         
-        cmd = f"@254QZ{channel}?;FF\r"  # Correct format, matching the pressure read command pattern
+        cmd = f"@{CONTROLLER_ADDRESS}QZ{channel}?;FF\r"
         response = self.send_command(cmd)
         
         if response:
@@ -430,7 +431,7 @@ class MFCController:
         # Keep the E+/- notation exactly as required by the 946
         
         # Create command string - ensure we're using the numeric channel
-        cmd = f"@254QSP{channel}!{scientific_value};FF\r"
+        cmd = f"@{CONTROLLER_ADDRESS}QSP{channel}!{scientific_value};FF\r"
         response = self.send_command(cmd)
         if response:
             if "ACK" in response:
@@ -458,7 +459,7 @@ class MFCController:
             return False
             
         # Check current mode
-        cmd = f"@254QFE{channel}?;FF\r"  # Query Flow Control Enable
+        cmd = f"@{CONTROLLER_ADDRESS}QFE{channel}?;FF\r"  # Query Flow Control Enable
         response = self.send_command(cmd)
         
         if not response:
@@ -467,7 +468,7 @@ class MFCController:
         # If mode is not already set to setpoint (1), set it
         if "ACK0" in response:  # 0 means not in setpoint mode
             # Set to setpoint mode
-            cmd = f"@254QFE{channel}!1;FF\r"
+            cmd = f"@{CONTROLLER_ADDRESS}QFE{channel}!1;FF\r"
             response = self.send_command(cmd)
             return "ACK" in response if response else False
             
@@ -493,13 +494,13 @@ class MFCController:
         # The following code is disabled to treat all channels as legacy
         '''
         # Query device type
-        cmd = f"@254QIT{channel}?;FF\r"  # Query Instrument Type
+        cmd = f"@{CONTROLLER_ADDRESS}QIT{channel}?;FF\r"  # Query Instrument Type
         response = self.send_command(cmd)
         
         if response:
             if "ACK" in response:
                 # Extract device type from response
-                device_info = response.replace("@253ACK", "").replace(";FF", "").strip()
+                device_info = re.sub(r'^@\\d+ACK', '', response).replace(";FF", "").strip()
                 return True, device_info
             else:
                 return False, f"Unexpected response: {response}"
@@ -520,13 +521,13 @@ class MFCController:
             return False, "Invalid channel number"
         
         # Query current setpoint
-        cmd = f"@254QSP{channel}?;FF\r"  # Query Setpoint
+        cmd = f"@{CONTROLLER_ADDRESS}QSP{channel}?;FF\r"  # Query Setpoint
         response = self.send_command(cmd)
         
         if response:
             if "ACK" in response:
                 # Extract setpoint from response
-                setpoint_str = response.replace("@253ACK", "").replace(";FF", "").strip()
+                setpoint_str = re.sub(r'^@\d+ACK', '', response).replace(";FF", "").strip()
                 try:
                     # Convert scientific notation to float
                     setpoint = float(setpoint_str)
@@ -558,7 +559,7 @@ class MFCController:
         # The following code is disabled to treat all channels as legacy
         '''
         # Check if flow control commands are supported
-        cmd = f"@254QFE{channel}?;FF\r"
+        cmd = f"@{CONTROLLER_ADDRESS}QFE{channel}?;FF\r"
         response = self.send_command(cmd)
         
         if not response:
@@ -1680,7 +1681,7 @@ class MainWindow(QMainWindow):
             report += f"Failed to get setpoint: {setpoint}\n"
         
         # 3. Check if setpoint mode is supported
-        cmd = f"@254QFE{channel}?;FF\r"
+        cmd = f"@{CONTROLLER_ADDRESS}QFE{channel}?;FF\r"
         response = self.serial_worker.controller.send_command(cmd)
         if response:
             report += f"Flow Control Query Response: {response}\n"
@@ -1720,12 +1721,12 @@ class MainWindow(QMainWindow):
             report += "No reading available\n"
         
         # 5. Check valve control mode
-        cmd = f"@254QVM{channel}?;FF\r"  # Query Valve Mode
+        cmd = f"@{CONTROLLER_ADDRESS}QVM{channel}?;FF\r"  # Query Valve Mode
         response = self.serial_worker.controller.send_command(cmd)
         if response:
             report += f"Valve Mode Response: {response}\n"
             if "ACK" in response:
-                mode_str = response.replace("@253ACK", "").replace(";FF", "").strip()
+                mode_str = re.sub(r'^@\d+ACK', '', response).replace(";FF", "").strip()
                 try:
                     mode = int(mode_str)
                     if mode == 0:
