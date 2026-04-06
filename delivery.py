@@ -717,6 +717,7 @@ class SerialWorker(QObject):
             return False, "Not connected to controller"
             
         try:
+            was_polling = self.polling_enabled
             self.stop_polling()
             if self.poll_in_progress:
                 deadline = time.monotonic() + 0.5
@@ -731,6 +732,9 @@ class SerialWorker(QObject):
         except Exception as e:
             print(f"Error zeroing channel: {e}")
             return False, f"Error: {e}"
+        finally:
+            if was_polling and self.controller:
+                self.start_polling()
     
     def set_flow_point(self, channel, flow_value):
         """Set flow point for the specified channel"""
@@ -738,6 +742,7 @@ class SerialWorker(QObject):
             return False, "Not connected to controller"
             
         try:
+            was_polling = self.polling_enabled
             self.stop_polling()
             if self.poll_in_progress:
                 deadline = time.monotonic() + 0.5
@@ -752,6 +757,9 @@ class SerialWorker(QObject):
         except Exception as e:
             print(f"Error setting flow point: {e}")
             return False, f"Error: {e}"
+        finally:
+            if was_polling and self.controller:
+                self.start_polling()
 
     def get_device_type(self, channel):
         """Get the type of device connected to the specified channel"""
@@ -1169,6 +1177,11 @@ class MainWindow(QMainWindow):
             flow_spinbox.setSingleStep(0.1)
             flow_spinbox.setMinimumHeight(28)
             flow_layout.addWidget(flow_spinbox, 1)
+
+            readback_label = QLabel("PV: ---")
+            readback_label.setMinimumWidth(90)
+            readback_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            flow_layout.addWidget(readback_label)
             
             set_button = QPushButton("Set")
             set_button.setMinimumHeight(28)
@@ -1179,6 +1192,7 @@ class MainWindow(QMainWindow):
             
             self.flow_controls[channel_key] = {
                 'spinbox': flow_spinbox,
+                'readback_label': readback_label,
                 'button': set_button,
                 'layout': flow_layout  # Store layout reference for adding monitor label
             }
@@ -1328,8 +1342,13 @@ class MainWindow(QMainWindow):
                 self.flow_controls[channel]['button'].setEnabled(True)
                 self.flow_controls[channel]['spinbox'].setEnabled(True)
                 self.flow_controls[channel]['button'].setText("Set")
+                self.flow_controls[channel]['readback_label'].setText("PV: ---")
                 if 'monitor_label' in self.flow_controls[channel]:
                     self.flow_controls[channel]['monitor_label'].hide()
+
+            self.start_time = None
+            self._load_current_setpoints()
+            self.serial_worker.start_polling()
                 
         elif status == "disconnected":
             self.status_label.setText("Status: Disconnected")
@@ -1341,10 +1360,12 @@ class MainWindow(QMainWindow):
             for channel in self.flow_controls:
                 self.flow_controls[channel]['button'].setEnabled(False)
                 self.flow_controls[channel]['spinbox'].setEnabled(False)
+                self.flow_controls[channel]['readback_label'].setText("PV: ---")
             
             # Disable buttons when disconnected
             self.zero_button.setEnabled(False)
             self.identify_mfc_button.setEnabled(False)
+            self.start_time = None
                 
         elif status == "connecting":
             self.status_label.setText("Status: Connecting...")
@@ -1354,6 +1375,20 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Permission Error")
             self.status_label.setStyleSheet("background-color: red; color: white; font-weight: bold; padding: 5px;")
             QMessageBox.warning(self, "Permission Error", "Please restart the application after logging back in.")
+
+    def _load_current_setpoints(self):
+        """Sync the UI setpoint controls from the controller's current values."""
+        if not self.serial_worker or not self.serial_worker.controller:
+            return
+
+        for channel_key in CHANNEL_KEYS:
+            channel_num = int(channel_key[2:])
+            success, setpoint = self.serial_worker.get_setpoint(channel_num)
+            if success and isinstance(setpoint, (int, float)):
+                spinbox = self.flow_controls[channel_key]['spinbox']
+                spinbox.blockSignals(True)
+                spinbox.setValue(setpoint)
+                spinbox.blockSignals(False)
     
     def disconnect_device(self):
         self.connect_button.setEnabled(False)
@@ -1371,6 +1406,7 @@ class MainWindow(QMainWindow):
             for i, channel_key in enumerate(CHANNEL_KEYS):
                 if i < len(self.serial_worker.pressure_readings):
                     value_str = self.serial_worker.pressure_readings[i]
+                    self.flow_controls[channel_key]['readback_label'].setText(f"PV: {value_str}")
                     if value_str != '---':
                         try:
                             value = float(value_str)
@@ -1394,6 +1430,19 @@ class MainWindow(QMainWindow):
                         self.curves[channel_key].setData(x_data, y_data)
             
             self.plot_widget.setXRange(x_min, x_max)
+            visible_values = []
+            for channel_key in CHANNEL_KEYS:
+                times = self.plot_data[channel_key]['time']
+                values = self.plot_data[channel_key]['value']
+                for x, y in zip(times, values):
+                    if x >= x_min:
+                        visible_values.append(y)
+
+            if visible_values:
+                y_min = min(visible_values)
+                y_max = max(visible_values)
+                margin = max((y_max - y_min) * 0.1, 1.0)
+                self.plot_widget.setYRange(y_min - margin, y_max + margin)
                         
         except Exception as e:
             print(f"Error updating plots: {e}")
