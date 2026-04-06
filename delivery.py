@@ -624,7 +624,7 @@ class SerialWorker(QObject):
         super().__init__()
         self.is_running = True
         self.controller = None
-        self.sampling_rate = 0.5
+        self.sampling_rate = 0.1
         self.pressure_readings = ["---"] * 6
         self.poll_in_progress = False
         self._stop_event = threading.Event()
