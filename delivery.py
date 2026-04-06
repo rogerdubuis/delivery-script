@@ -1687,6 +1687,24 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Zero Failed", f"Failed to zero channel {channel_display_name}: {message}")
             print(f"Failed to zero channel {channel_display_name}: {message}")
 
+    def _pause_background_polling(self, timeout=1.0):
+        """Pause background polling and wait for any active poll to finish."""
+        if not self.serial_worker:
+            return False
+
+        was_polling = self.serial_worker.polling_enabled
+        self.serial_worker.stop_polling()
+        if self.serial_worker.poll_in_progress:
+            deadline = time.monotonic() + timeout
+            while self.serial_worker.poll_in_progress and time.monotonic() < deadline:
+                time.sleep(0.01)
+        return was_polling
+
+    def _resume_background_polling(self, was_polling):
+        """Resume background polling if it was previously running."""
+        if was_polling and self.serial_worker and self.serial_worker.controller:
+            self.serial_worker.start_polling()
+
     def diagnose_channel(self):
         """Diagnose a channel to troubleshoot issues with zeroing or setting flow points"""
         if not self.serial_worker:
@@ -1718,6 +1736,7 @@ class MainWindow(QMainWindow):
         
         # Disable UI while diagnosing
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        was_polling = self._pause_background_polling()
         
         # Create diagnostic report
         report = f"Diagnostic Report for {channel_display_name}:\n"
@@ -1737,101 +1756,105 @@ class MainWindow(QMainWindow):
         report += "- Slot B = channels 3 and 4 (B1 and B2)\n"
         report += "- Slot C = channels 5 and 6 (C1 and C2)\n\n"
         
-        # Check if this channel supports flow control
-        supports_control = self.serial_worker.supports_flow_control(channel)
-        if supports_control:
-            report += "Channel Type: CONTROLLABLE (Supports flow control)\n"
-        else:
-            report += "Channel Type: MONITOR ONLY (Does not support flow control)\n"
-            report += "Note: This channel can only measure flow, not control it.\n"
-            report += "      The UI has been updated to mark this as a monitor-only channel.\n\n"
-            report += "POSSIBLE CAUSES:\n"
-            report += "1. No MFC hardware is physically installed in this slot\n"
-            report += "2. There is a gauge board installed in this slot instead of an MFC board\n"
-            report += "3. The MFC is installed in a different slot (use the corresponding channel number)\n"
-            report += "4. Incorrect wiring or connection issues with the MFC hardware\n\n"
-        
-        # Get device type
-        success, device_type = self.serial_worker.get_device_type(channel)
-        if success:
-            report += f"Device Type: {device_type}\n"
-            # Add interpretation of device type
-            if "MFC" in str(device_type) or device_type in ["179", "1179"]:
-                report += "This appears to be an MFC device type\n"
-            else:
-                report += "This does NOT appear to be an MFC device type\n"
-        else:
-            report += f"Failed to get device type: {device_type}\n"
-        
-        # 2. Check current setpoint
-        success, setpoint = self.serial_worker.get_setpoint(channel)
-        if success:
-            report += f"Current Setpoint: {setpoint} SCCM\n"
-        else:
-            report += f"Failed to get setpoint: {setpoint}\n"
-        
-        # 3. Check the current MFC mode
-        cmd = f"@{CONTROLLER_ADDRESS}QMD{channel}?;FF\r"
-        response = self.serial_worker.controller.send_command(cmd)
-        if response:
-            report += f"MFC Mode Query Response: {response}\n"
-            if "NAK" in response:
-                report += "Status: MFC mode query not supported for this channel\n"
-                report += "This indicates the 946 may not detect an MFC on this channel.\n"
-                report += "Check the physical installation and slot mapping.\n"
-            else:
-                mode_match = re.search(r'@\d+ACK(.*?);FF', response)
-                if mode_match:
-                    report += f"Status: Current mode = {mode_match.group(1).strip()}\n"
-        else:
-            report += "No response to MFC mode query\n"
-        
-        # 4. Read current value
-        response = self.serial_worker.controller.read_pressure(channel)
-        if response:
-            report += f"Current Reading: {response}\n"
-            parsed = self.serial_worker.controller.parse_pressure_response(response)
-            if parsed is not None:
-                report += f"Parsed Value: {parsed} SCCM\n"
-                
-                # Compare with setpoint if available
-                if success and isinstance(setpoint, (int, float)):
-                    difference = parsed - setpoint
-                    percentage = (parsed / setpoint * 100) if setpoint != 0 else float('inf')
-                    report += f"Difference from Setpoint: {difference:.2f} SCCM ({percentage:.1f}%)\n"
-                    
-                    if abs(difference) > 5 and abs(percentage - 100) > 10:
-                        report += "ISSUE: Flow is significantly different from setpoint.\n"
-                        report += "This could indicate:\n"
-                        report += "- Physical flow limitations\n"
-                        report += "- Slow controller response\n"
-                        report += "- External flow restrictions\n"
-                        report += "- System needs calibration\n"
-        else:
-            report += "No reading available\n"
-        
-        # 5. Check valve control mode
-        cmd = f"@{CONTROLLER_ADDRESS}QVM{channel}?;FF\r"  # Query Valve Mode
-        response = self.serial_worker.controller.send_command(cmd)
-        if response:
-            report += f"Valve Mode Response: {response}\n"
-            if "ACK" in response:
-                mode_str = re.sub(r'^@\d+ACK', '', response).replace(";FF", "").strip()
-                try:
-                    mode = int(mode_str)
-                    if mode == 0:
-                        report += "Valve Mode: Normal (0)\n"
-                    elif mode == 1:
-                        report += "Valve Mode: Close (1)\n"
-                    elif mode == 2:
-                        report += "Valve Mode: Open (2)\n"
+        try:
+            with self.serial_worker._serial_lock:
+                controller = self.serial_worker.controller
+
+                # Check if this channel supports flow control
+                supports_control = controller.supports_flow_control(channel)
+                if supports_control:
+                    report += "Channel Type: CONTROLLABLE (Supports flow control)\n"
+                else:
+                    report += "Channel Type: MONITOR ONLY (Does not support flow control)\n"
+                    report += "Note: This channel can only measure flow, not control it.\n"
+                    report += "      The UI has been updated to mark this as a monitor-only channel.\n\n"
+                    report += "POSSIBLE CAUSES:\n"
+                    report += "1. No MFC hardware is physically installed in this slot\n"
+                    report += "2. There is a gauge board installed in this slot instead of an MFC board\n"
+                    report += "3. The MFC is installed in a different slot (use the corresponding channel number)\n"
+                    report += "4. Incorrect wiring or connection issues with the MFC hardware\n\n"
+
+                # Get device type
+                success, device_type = controller.get_device_type(channel)
+                if success:
+                    report += f"Device Type: {device_type}\n"
+                    # Add interpretation of device type
+                    if "MFC" in str(device_type) or device_type in ["179", "1179"]:
+                        report += "This appears to be an MFC device type\n"
                     else:
-                        report += f"Valve Mode: Unknown ({mode})\n"
-                except ValueError:
-                    report += f"Valve Mode: Unable to parse ({mode_str})\n"
-        
-        # Reset cursor
-        QApplication.restoreOverrideCursor()
+                        report += "This does NOT appear to be an MFC device type\n"
+                else:
+                    report += f"Failed to get device type: {device_type}\n"
+
+                # 2. Check current setpoint
+                success, setpoint = controller.get_setpoint(channel)
+                if success:
+                    report += f"Current Setpoint: {setpoint} SCCM\n"
+                else:
+                    report += f"Failed to get setpoint: {setpoint}\n"
+
+                # 3. Check the current MFC mode
+                cmd = f"@{CONTROLLER_ADDRESS}QMD{channel}?;FF\r"
+                response = controller.send_command(cmd)
+                if response:
+                    report += f"MFC Mode Query Response: {response}\n"
+                    if "NAK" in response:
+                        report += "Status: MFC mode query not supported for this channel\n"
+                        report += "This indicates the 946 may not detect an MFC on this channel.\n"
+                        report += "Check the physical installation and slot mapping.\n"
+                    else:
+                        mode_match = re.search(r'@\d+ACK(.*?);FF', response)
+                        if mode_match:
+                            report += f"Status: Current mode = {mode_match.group(1).strip()}\n"
+                else:
+                    report += "No response to MFC mode query\n"
+
+                # 4. Read current value
+                response = controller.read_pressure(channel)
+                if response:
+                    report += f"Current Reading: {response}\n"
+                    parsed = controller.parse_pressure_response(response)
+                    if parsed is not None:
+                        report += f"Parsed Value: {parsed} SCCM\n"
+
+                        # Compare with setpoint if available
+                        if success and isinstance(setpoint, (int, float)):
+                            difference = parsed - setpoint
+                            percentage = (parsed / setpoint * 100) if setpoint != 0 else float('inf')
+                            report += f"Difference from Setpoint: {difference:.2f} SCCM ({percentage:.1f}%)\n"
+
+                            if abs(difference) > 5 and abs(percentage - 100) > 10:
+                                report += "ISSUE: Flow is significantly different from setpoint.\n"
+                                report += "This could indicate:\n"
+                                report += "- Physical flow limitations\n"
+                                report += "- Slow controller response\n"
+                                report += "- External flow restrictions\n"
+                                report += "- System needs calibration\n"
+                else:
+                    report += "No reading available\n"
+
+                # 5. Check valve control mode
+                cmd = f"@{CONTROLLER_ADDRESS}QVM{channel}?;FF\r"  # Query Valve Mode
+                response = controller.send_command(cmd)
+                if response:
+                    report += f"Valve Mode Response: {response}\n"
+                    if "ACK" in response:
+                        mode_str = re.sub(r'^@\d+ACK', '', response).replace(";FF", "").strip()
+                        try:
+                            mode = int(mode_str)
+                            if mode == 0:
+                                report += "Valve Mode: Normal (0)\n"
+                            elif mode == 1:
+                                report += "Valve Mode: Close (1)\n"
+                            elif mode == 2:
+                                report += "Valve Mode: Open (2)\n"
+                            else:
+                                report += f"Valve Mode: Unknown ({mode})\n"
+                        except ValueError:
+                            report += f"Valve Mode: Unable to parse ({mode_str})\n"
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._resume_background_polling(was_polling)
         
         # Show report
         dialog = QDialog(self)
@@ -1864,9 +1887,15 @@ class MainWindow(QMainWindow):
         if not self.serial_worker or not self.serial_worker.controller:
             QMessageBox.warning(self, "Not Connected", "Please connect to the device first")
             return
-            
-        # Probe channels using documented 946 MFC commands
-        mfc_channels = self.serial_worker.controller.probe_mfc_channels()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        was_polling = self._pause_background_polling()
+        try:
+            with self.serial_worker._serial_lock:
+                mfc_channels = self.serial_worker.controller.probe_mfc_channels()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._resume_background_polling(was_polling)
         
         # Create report
         report = "MFC CHANNEL PROBE\n"
@@ -2018,6 +2047,8 @@ class MainWindow(QMainWindow):
         plot_widget.addItem(setpoint_line)
         
         flow_curve = plot_widget.plot(pen='b')
+
+        was_polling = self._pause_background_polling()
         
         # Setup timer for reading flow
         start_time = time.time()
@@ -2027,7 +2058,8 @@ class MainWindow(QMainWindow):
             times.append(elapsed)
             
             # Get current flow
-            response = self.serial_worker.controller.read_pressure(channel)
+            with self.serial_worker._serial_lock:
+                response = self.serial_worker.controller.read_pressure(channel)
             if response:
                 parsed = self.serial_worker.controller.parse_pressure_response(response)
                 if parsed is not None:
@@ -2063,6 +2095,7 @@ class MainWindow(QMainWindow):
         
         # Stop timer when dialog closes
         dialog.finished.connect(timer.stop)
+        dialog.finished.connect(lambda _: self._resume_background_polling(was_polling))
         
         dialog.exec()
 
@@ -2074,7 +2107,12 @@ class MainWindow(QMainWindow):
         # First identify all MFC channels
         print("Checking channel responses with native 946 MFC commands...")
         if self.serial_worker.controller:
-            mfc_channels = self.serial_worker.controller.probe_mfc_channels()
+            was_polling = self._pause_background_polling()
+            try:
+                with self.serial_worker._serial_lock:
+                    mfc_channels = self.serial_worker.controller.probe_mfc_channels()
+            finally:
+                self._resume_background_polling(was_polling)
             
             # Display a notification about detected MFCs
             detected_mfcs = []
