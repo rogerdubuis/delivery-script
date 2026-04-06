@@ -1179,9 +1179,10 @@ class MainWindow(QMainWindow):
             flow_layout.addWidget(flow_spinbox, 1)
 
             readback_label = QLabel("PV: ---")
-            readback_label.setFixedWidth(110)
-            readback_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            readback_label.setFixedWidth(100)
+            readback_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             flow_layout.addWidget(readback_label)
+            flow_layout.addSpacing(8)
             
             set_button = QPushButton("Set")
             set_button.setFixedWidth(48)
