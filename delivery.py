@@ -1765,13 +1765,11 @@ class MainWindow(QMainWindow):
         self.serial_worker.connect_device(port=port)
         
     def scan_ports(self):
-        """Find a serial port and verify that an MKS controller replies."""
-        global CONTROLLER_ADDRESS
-
+        """Scan OS serial ports without blocking on controller responses."""
         # Reset the controller instance to use the dynamic detection
         MFCController._instance = None
         
-        # This only identifies the OS serial port; the probe below verifies the controller.
+        # This identifies the OS serial port. Controller communication is tested after connect.
         port = MFCController.find_serial_port()
         
         # Refresh the port list
@@ -1782,30 +1780,8 @@ class MainWindow(QMainWindow):
             if self.port_combo.itemText(i) == port:
                 self.port_combo.setCurrentIndex(i)
                 break
-
-        probe = MFCController.probe_controller(port)
-        if not probe:
-            QMessageBox.warning(
-                self,
-                "Port Scan Complete",
-                (
-                    f"Found serial port {port}, but the MKS controller did not reply.\n\n"
-                    "This means the OS sees the serial hardware, but the controller is not "
-                    "responding on that port/address."
-                )
-            )
-            return
-
-        CONTROLLER_ADDRESS = probe["address"]
-        QMessageBox.information(
-            self,
-            "Port Scan Complete",
-            (
-                f"MKS controller responded on {probe['port']} at address {probe['address']}.\n\n"
-                f"Command: {probe['command']}\n"
-                f"Response: {probe['response']}"
-            )
-        )
+                
+        QMessageBox.information(self, "Port Scan Complete", f"Found serial port {port}")
         
         # Connect to the new port
         self.connect_device()
@@ -2497,12 +2473,15 @@ def probe_serial_mode(port=DEFAULT_PORT):
     print("At this point the likely causes are controller serial/remote mode, address, cabling, or the controller serial interface.")
 
 if __name__ == "__main__":
+    args = [arg.strip().replace("\u2013", "-").replace("\u2014", "-") for arg in sys.argv[1:]]
+
     # Check if terminal mode is requested
-    if len(sys.argv) > 1 and sys.argv[1] in ['-t', '--terminal']:
-        terminal_mode()
-    elif len(sys.argv) > 1 and sys.argv[1] == '--probe-serial':
-        probe_port = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PORT
+    if "--probe-serial" in args:
+        probe_index = args.index("--probe-serial")
+        probe_port = args[probe_index + 1] if len(args) > probe_index + 1 else DEFAULT_PORT
         probe_serial_mode(probe_port)
+    elif any(arg in ['-t', '--terminal'] for arg in args):
+        terminal_mode()
     else:
         app = QApplication(sys.argv)
         
