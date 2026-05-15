@@ -35,6 +35,9 @@ ENABLE_SIGNAL_PROCESSING = False
 LEGACY_FIRMWARE_MODE = True
 DEBUG_SERIAL = os.environ.get("DELIVERY_DEBUG_SERIAL", "1") != "0"
 CONTROLLER_ADDRESS = os.environ.get("DELIVERY_CONTROLLER_ADDRESS", "253")
+SERIAL_TIMEOUT = float(os.environ.get("DELIVERY_SERIAL_TIMEOUT", "0.2"))
+POLL_INTERVAL = float(os.environ.get("DELIVERY_POLL_INTERVAL", "0.2"))
+POLL_COMMAND_TIMEOUT = float(os.environ.get("DELIVERY_POLL_COMMAND_TIMEOUT", "0.025"))
 
 # Custom channel names - modify these to change display names throughout the application
 # The keys must remain as Ch1-Ch6 for internal functionality
@@ -57,6 +60,10 @@ DISPLAY_TO_CHANNEL = {v: k for k, v in CHANNEL_NAMES.items()}
 
 # List of internal channel keys (used for iterations)
 CHANNEL_KEYS = ['Ch1', 'Ch2', 'Ch3', 'Ch4', 'Ch5', 'Ch6']
+
+def serial_open_kwargs():
+    """Use exclusive port access on POSIX so stale app instances cannot steal replies."""
+    return {} if IS_WINDOWS else {"exclusive": True}
 
 def setup_permissions():
     if IS_WINDOWS:
@@ -160,6 +167,63 @@ class MFCController:
             all_ports = usb_ports + serial_ports + acm_ports
             
         return sorted(all_ports)
+
+    @staticmethod
+    def probe_controller(port, addresses=None, timeout=0.2):
+        """Return probe details if an MKS controller replies on this serial port."""
+        if addresses is None:
+            addresses = [CONTROLLER_ADDRESS, "254", "1", "001", "0", "000"]
+
+        seen = set()
+        unique_addresses = []
+        for address in addresses:
+            address = str(address)
+            if address not in seen:
+                seen.add(address)
+                unique_addresses.append(address)
+
+        try:
+            with serial.Serial(
+                port=port,
+                baudrate=9600,
+                timeout=timeout,
+                write_timeout=timeout,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
+                **serial_open_kwargs()
+            ) as ser:
+                for address in unique_addresses:
+                    for command_name in ("FR1?", "QSP1?"):
+                        command = f"@{address}{command_name};FF\r"
+                        ser.reset_input_buffer()
+                        ser.write(command.encode())
+
+                        deadline = time.monotonic() + timeout
+                        response = bytearray()
+                        while time.monotonic() < deadline:
+                            waiting = ser.in_waiting
+                            if waiting:
+                                response.extend(ser.read(waiting))
+                                if b";FF" in response or b"ACK" in response or b"NAK" in response:
+                                    break
+                            else:
+                                time.sleep(0.005)
+
+                        if response:
+                            return {
+                                "port": port,
+                                "address": address,
+                                "command": command.strip(),
+                                "response": response.decode("ascii", errors="replace").strip()
+                            }
+        except Exception as e:
+            print(f"Controller probe failed on {port}: {e}")
+
+        return None
     
     def __init__(self, port=None, baudrate=9600, timeout=1):
         if port is None:
@@ -175,7 +239,8 @@ class MFCController:
                 stopbits=serial.STOPBITS_ONE,
                 xonxoff=False,
                 rtscts=False,
-                dsrdtr=False
+                dsrdtr=False,
+                **serial_open_kwargs()
             )
             print(f"Connected to controller on {port}")
             if DEBUG_SERIAL:
@@ -219,9 +284,10 @@ class MFCController:
         print(f"  ascii: {ascii_payload!r}")
         print(f"  hex:   {hex_payload}")
 
-    def send_command(self, command):
+    def send_command(self, command, timeout=None):
         try:
             started = time.monotonic()
+            command_timeout = SERIAL_TIMEOUT if timeout is None else timeout
             self.ser.reset_input_buffer()
             encoded_command = command.encode()
             self._log_serial_payload("TX", command, encoded_command)
@@ -232,7 +298,7 @@ class MFCController:
                     f"for command {command.strip()}"
                 )
 
-            deadline = time.monotonic() + max(float(self.ser.timeout or 0), 0.05) + 0.1
+            deadline = time.monotonic() + max(float(command_timeout), 0.005)
             response = bytearray()
             while time.monotonic() < deadline:
                 waiting = self.ser.in_waiting
@@ -303,12 +369,12 @@ class MFCController:
             self.ser.close()
             print(f"Closed connection to {self.port}")
     
-    def read_pressure(self, channel):
+    def read_pressure(self, channel, timeout=None):
         """Read flow from specified MFC channel using the 946 FR command."""
         if not 1 <= channel <= 6:
             return None
         cmd = f"@{CONTROLLER_ADDRESS}FR{channel}?;FF\r"
-        return self.send_command(cmd)
+        return self.send_command(cmd, timeout=timeout)
     
     def parse_pressure_response(self, response):
         """Parse ACK response payload between @<addr>ACK and ;FF."""
@@ -332,11 +398,11 @@ class MFCController:
         except Exception:
             return None
     
-    def read_all_pressures(self, verbose=True):
+    def read_all_pressures(self, verbose=True, command_timeout=None):
         """Read all pressure channels with minimal delay"""
         readings = []
         for i in range(1, 7):
-            response = self.read_pressure(i)
+            response = self.read_pressure(i, timeout=command_timeout)
             value = self.parse_pressure_response(response)
             if isinstance(value, float):
                 readings.append(f"{value:.1f}")
@@ -635,7 +701,7 @@ class SerialWorker(QObject):
         super().__init__()
         self.is_running = True
         self.controller = None
-        self.sampling_rate = 0.1
+        self.sampling_rate = POLL_INTERVAL
         self.pressure_readings = ["---"] * 6
         self.poll_in_progress = False
         self._stop_event = threading.Event()
@@ -652,7 +718,7 @@ class SerialWorker(QObject):
                 return False
 
             selected_port = port or DEFAULT_PORT
-            self.controller = MFCController(port=selected_port, timeout=0.2)
+            self.controller = MFCController(port=selected_port, timeout=SERIAL_TIMEOUT)
             MFCController._instance = self.controller
             self._stop_event.clear()
             self.connection_status.emit("connected")
@@ -664,9 +730,11 @@ class SerialWorker(QObject):
 
     def _poll_loop(self):
         while not self._stop_event.is_set():
+            cycle_started = time.monotonic()
             if self.polling_enabled:
                 self.read_data()
-            self._stop_event.wait(self.sampling_rate)
+            elapsed = time.monotonic() - cycle_started
+            self._stop_event.wait(max(0.0, self.sampling_rate - elapsed))
 
     def start_polling(self):
         if not self.controller:
@@ -705,7 +773,10 @@ class SerialWorker(QObject):
         try:
             # Serial polling runs off the UI thread; keep terminal readbacks visible.
             with self._serial_lock:
-                self.pressure_readings = self.controller.read_all_pressures(verbose=True)
+                self.pressure_readings = self.controller.read_all_pressures(
+                    verbose=True,
+                    command_timeout=POLL_COMMAND_TIMEOUT
+                )
             flow_data = {'timestamp': time.time()}
             self.data.emit(flow_data)
         except Exception as e:
@@ -1694,11 +1765,13 @@ class MainWindow(QMainWindow):
         self.serial_worker.connect_device(port=port)
         
     def scan_ports(self):
-        """Scan for all available ports using the find_serial_port method which requires admin access"""
+        """Find a serial port and verify that an MKS controller replies."""
+        global CONTROLLER_ADDRESS
+
         # Reset the controller instance to use the dynamic detection
         MFCController._instance = None
         
-        # This will trigger the find_serial_port method which uses lspci and dmesg
+        # This only identifies the OS serial port; the probe below verifies the controller.
         port = MFCController.find_serial_port()
         
         # Refresh the port list
@@ -1709,8 +1782,30 @@ class MainWindow(QMainWindow):
             if self.port_combo.itemText(i) == port:
                 self.port_combo.setCurrentIndex(i)
                 break
-                
-        QMessageBox.information(self, "Port Scan Complete", f"Found device on {port}")
+
+        probe = MFCController.probe_controller(port)
+        if not probe:
+            QMessageBox.warning(
+                self,
+                "Port Scan Complete",
+                (
+                    f"Found serial port {port}, but the MKS controller did not reply.\n\n"
+                    "This means the OS sees the serial hardware, but the controller is not "
+                    "responding on that port/address."
+                )
+            )
+            return
+
+        CONTROLLER_ADDRESS = probe["address"]
+        QMessageBox.information(
+            self,
+            "Port Scan Complete",
+            (
+                f"MKS controller responded on {probe['port']} at address {probe['address']}.\n\n"
+                f"Command: {probe['command']}\n"
+                f"Response: {probe['response']}"
+            )
+        )
         
         # Connect to the new port
         self.connect_device()
@@ -2333,10 +2428,81 @@ def terminal_mode():
         print(f"Error: {e}")
         sys.exit(1)
 
+def probe_serial_mode(port=DEFAULT_PORT):
+    """Run a raw serial probe outside the GUI/polling loop."""
+    addresses = []
+    for address in (CONTROLLER_ADDRESS, "253", "254", "1", "001", "0", "000"):
+        if address not in addresses:
+            addresses.append(address)
+
+    settings = [
+        (9600, serial.PARITY_NONE, serial.STOPBITS_ONE),
+        (9600, serial.PARITY_EVEN, serial.STOPBITS_ONE),
+        (19200, serial.PARITY_NONE, serial.STOPBITS_ONE),
+        (4800, serial.PARITY_NONE, serial.STOPBITS_ONE),
+    ]
+    command_names = ("FR1?", "QSP1?", "QMD1?")
+    terminators = ("\r", "\n", "\r\n")
+
+    print(f"Raw serial probe on {port}")
+    print("Trying common MKS 946 settings. Any response, including NAK, is useful.")
+
+    for baudrate, parity, stopbits in settings:
+        try:
+            with serial.Serial(
+                port=port,
+                baudrate=baudrate,
+                timeout=0.25,
+                write_timeout=0.25,
+                bytesize=serial.EIGHTBITS,
+                parity=parity,
+                stopbits=stopbits,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
+                **serial_open_kwargs()
+            ) as ser:
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                print(f"\nSettings: baud={baudrate}, parity={parity}, stopbits={stopbits}")
+
+                for address in addresses:
+                    for command_name in command_names:
+                        for terminator in terminators:
+                            command = f"@{address}{command_name};FF{terminator}"
+                            ser.reset_input_buffer()
+                            ser.write(command.encode("ascii"))
+
+                            deadline = time.monotonic() + 0.25
+                            response = bytearray()
+                            while time.monotonic() < deadline:
+                                waiting = ser.in_waiting
+                                if waiting:
+                                    response.extend(ser.read(waiting))
+                                    if b";FF" in response or b"ACK" in response or b"NAK" in response:
+                                        break
+                                else:
+                                    time.sleep(0.005)
+
+                            if response:
+                                print("RESPONSE FOUND")
+                                print(f"  command: {command!r}")
+                                print(f"  ascii:   {response.decode('ascii', errors='replace')!r}")
+                                print(f"  hex:     {bytes(response).hex(' ')}")
+                                return
+        except Exception as e:
+            print(f"Could not probe {port} at baud={baudrate}, parity={parity}: {e}")
+
+    print("\nNo response to any probe command.")
+    print("At this point the likely causes are controller serial/remote mode, address, cabling, or the controller serial interface.")
+
 if __name__ == "__main__":
     # Check if terminal mode is requested
     if len(sys.argv) > 1 and sys.argv[1] in ['-t', '--terminal']:
         terminal_mode()
+    elif len(sys.argv) > 1 and sys.argv[1] == '--probe-serial':
+        probe_port = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PORT
+        probe_serial_mode(probe_port)
     else:
         app = QApplication(sys.argv)
         
