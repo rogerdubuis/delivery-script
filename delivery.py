@@ -599,7 +599,10 @@ class MFCController:
         if not 1 <= channel <= 6:
             return False
             
-        # Special case for all channels with older firmware
+        # Older 946/FC firmware may not answer probe commands even though QSP setpoints work.
+        if LEGACY_FIRMWARE_MODE:
+            return True
+
         probe = self.probe_mfc_channel(channel)
         return probe['is_mfc']
         
