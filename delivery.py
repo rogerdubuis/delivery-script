@@ -225,8 +225,12 @@ class MFCController:
             self.ser.reset_input_buffer()
             encoded_command = command.encode()
             self._log_serial_payload("TX", command, encoded_command)
-            self.ser.write(encoded_command)
-            self.ser.flush()
+            bytes_written = self.ser.write(encoded_command)
+            if bytes_written != len(encoded_command):
+                print(
+                    f"Warning: wrote {bytes_written}/{len(encoded_command)} bytes "
+                    f"for command {command.strip()}"
+                )
 
             deadline = time.monotonic() + max(float(self.ser.timeout or 0), 0.05) + 0.1
             response = bytearray()
@@ -248,6 +252,10 @@ class MFCController:
                     return None
             elapsed_ms = (time.monotonic() - started) * 1000
             self._log_serial_payload("RX", command, b"", elapsed_ms=elapsed_ms, note="timeout/no response")
+            return None
+        except serial.SerialTimeoutException as e:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            print(f"Serial write timed out for {command.strip()} after {elapsed_ms:.1f} ms: {e}")
             return None
         except Exception as e:
             print(f"Error sending command {command.strip()}: {e}")
@@ -631,6 +639,7 @@ class SerialWorker(QObject):
         self._serial_lock = threading.Lock()
         self._poll_thread = None
         self.polling_enabled = False
+        self.command_lock_timeout = 5.0
     
     def connect_device(self, port=None):
         try:
@@ -666,6 +675,24 @@ class SerialWorker(QObject):
 
     def stop_polling(self):
         self.polling_enabled = False
+
+    def _pause_polling_and_acquire_lock(self, timeout=None):
+        """Stop background reads and wait for exclusive serial access."""
+        if timeout is None:
+            timeout = self.command_lock_timeout
+
+        was_polling = self.polling_enabled
+        self.stop_polling()
+
+        deadline = time.monotonic() + timeout
+        while self.poll_in_progress and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        remaining = max(0.1, deadline - time.monotonic())
+        if not self._serial_lock.acquire(timeout=remaining):
+            return was_polling, False
+
+        return was_polling, True
     
     def read_data(self):
         if not self.controller or self.poll_in_progress:
@@ -673,9 +700,9 @@ class SerialWorker(QObject):
             
         self.poll_in_progress = True
         try:
-            # Poll only pressure readings here to keep the UI responsive.
+            # Serial polling runs off the UI thread; keep terminal readbacks visible.
             with self._serial_lock:
-                self.pressure_readings = self.controller.read_all_pressures(verbose=False)
+                self.pressure_readings = self.controller.read_all_pressures(verbose=True)
             flow_data = {'timestamp': time.time()}
             self.data.emit(flow_data)
         except Exception as e:
@@ -717,13 +744,8 @@ class SerialWorker(QObject):
             return False, "Not connected to controller"
             
         try:
-            was_polling = self.polling_enabled
-            self.stop_polling()
-            if self.poll_in_progress:
-                deadline = time.monotonic() + 0.5
-                while self.poll_in_progress and time.monotonic() < deadline:
-                    time.sleep(0.01)
-            if not self._serial_lock.acquire(timeout=0.5):
+            was_polling, lock_acquired = self._pause_polling_and_acquire_lock()
+            if not lock_acquired:
                 return False, "Timed out waiting for serial device"
             try:
                 return self.controller.zero_channel(channel)
@@ -742,13 +764,8 @@ class SerialWorker(QObject):
             return False, "Not connected to controller"
             
         try:
-            was_polling = self.polling_enabled
-            self.stop_polling()
-            if self.poll_in_progress:
-                deadline = time.monotonic() + 0.5
-                while self.poll_in_progress and time.monotonic() < deadline:
-                    time.sleep(0.01)
-            if not self._serial_lock.acquire(timeout=0.5):
+            was_polling, lock_acquired = self._pause_polling_and_acquire_lock()
+            if not lock_acquired:
                 return False, "Timed out waiting for serial device"
             try:
                 return self.controller.set_flow_point(channel, flow_value)
@@ -1366,7 +1383,7 @@ class MainWindow(QMainWindow):
                     self.flow_controls[channel]['monitor_label'].hide()
 
             self.start_time = None
-            self._load_current_setpoints_async()
+            self.serial_worker.start_polling()
                 
         elif status == "disconnected":
             self.status_label.setText("Status: Disconnected")
