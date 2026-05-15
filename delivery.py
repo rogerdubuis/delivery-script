@@ -196,6 +196,12 @@ class MFCController:
                 dsrdtr=False,
                 **serial_open_kwargs()
             ) as ser:
+                try:
+                    ser.setDTR(True)
+                    ser.setRTS(True)
+                except Exception as e:
+                    print(f"Warning: could not assert DTR/RTS during probe: {e}")
+
                 for address in unique_addresses:
                     for command_name in ("FR1?", "QSP1?"):
                         command = f"@{address}{command_name};FF\r"
@@ -242,6 +248,11 @@ class MFCController:
                 dsrdtr=False,
                 **serial_open_kwargs()
             )
+            try:
+                self.ser.setDTR(True)
+                self.ser.setRTS(True)
+            except Exception as e:
+                print(f"Warning: could not assert DTR/RTS: {e}")
             print(f"Connected to controller on {port}")
             if DEBUG_SERIAL:
                 print(
@@ -2420,8 +2431,8 @@ def probe_serial_mode(port=DEFAULT_PORT):
     command_names = ("FR1?", "QSP1?", "QMD1?")
     terminators = ("\r", "\n", "\r\n")
 
-    print(f"Raw serial probe on {port}")
-    print("Trying common MKS 946 settings. Any response, including NAK, is useful.")
+    print(f"Raw serial probe on {port}", flush=True)
+    print("Trying common MKS 946 settings. Any response, including NAK, is useful.", flush=True)
 
     for baudrate, parity, stopbits in settings:
         try:
@@ -2438,14 +2449,20 @@ def probe_serial_mode(port=DEFAULT_PORT):
                 dsrdtr=False,
                 **serial_open_kwargs()
             ) as ser:
+                try:
+                    ser.setDTR(True)
+                    ser.setRTS(True)
+                except Exception as e:
+                    print(f"Warning: could not assert DTR/RTS: {e}", flush=True)
+
                 ser.reset_input_buffer()
-                ser.reset_output_buffer()
-                print(f"\nSettings: baud={baudrate}, parity={parity}, stopbits={stopbits}")
+                print(f"\nSettings: baud={baudrate}, parity={parity}, stopbits={stopbits}", flush=True)
 
                 for address in addresses:
                     for command_name in command_names:
                         for terminator in terminators:
                             command = f"@{address}{command_name};FF{terminator}"
+                            print(f"  trying: {command!r}", flush=True)
                             ser.reset_input_buffer()
                             ser.write(command.encode("ascii"))
 
@@ -2466,11 +2483,12 @@ def probe_serial_mode(port=DEFAULT_PORT):
                                 print(f"  ascii:   {response.decode('ascii', errors='replace')!r}")
                                 print(f"  hex:     {bytes(response).hex(' ')}")
                                 return
+                print("  no response for these settings", flush=True)
         except Exception as e:
-            print(f"Could not probe {port} at baud={baudrate}, parity={parity}: {e}")
+            print(f"Could not probe {port} at baud={baudrate}, parity={parity}: {e}", flush=True)
 
-    print("\nNo response to any probe command.")
-    print("At this point the likely causes are controller serial/remote mode, address, cabling, or the controller serial interface.")
+    print("\nNo response to any probe command.", flush=True)
+    print("At this point the likely causes are controller serial/remote mode, address, cabling, or the controller serial interface.", flush=True)
 
 if __name__ == "__main__":
     args = [arg.strip().replace("\u2013", "-").replace("\u2014", "-") for arg in sys.argv[1:]]
